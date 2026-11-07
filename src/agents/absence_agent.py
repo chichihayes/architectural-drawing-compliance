@@ -78,13 +78,45 @@ def _group_terms(page_class: str, subtype: str, covered_params: list[str]) -> se
     return words - _STOPWORDS
 
 
+_MAX_RAW_TEXT_CHARS = 6000
+
+
+def _load_raw_page_text(pdf_out_dir: Path, page_numbers: list[int]) -> str:
+    """Reconstruct the drawing's own text (titleblock notes, specification
+    callouts, etc.) from Stage A's saved vector extraction -- free, since
+    it's already on disk, no extra API call.
+
+    This exists because a drawing can satisfy a requirement by stating it as
+    a general note (e.g. quoting a regulation's wording directly) without
+    that note ever becoming a Stage B *fact* -- facts need a specific value,
+    and a "shall comply" statement has none. Without seeing the drawing's
+    actual text, Stage D can only see the curated parameter list and wrongly
+    concludes anything not on it was never addressed.
+    """
+    parts: list[str] = []
+    for page_number in page_numbers:
+        vector_path = pdf_out_dir / f"page_{page_number:03d}_vector.json"
+        if not vector_path.exists():
+            continue
+        try:
+            data = json.loads(vector_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        spans = data.get("text_spans", [])
+        parts.append(" ".join(s.get("text", "") for s in spans))
+    text = " ".join(parts)
+    return text[:_MAX_RAW_TEXT_CHARS]
+
+
 def _build_absence_prompt(
     page_class: str,
     subtype: str,
     covered_params: list[str],
     candidates: list[RegulationChunk],
+    raw_text: str,
 ) -> str:
     covered_block = ", ".join(covered_params) if covered_params else "(none extracted)"
+    raw_text_block = raw_text.strip() or "(no text could be read from this drawing)"
 
     if candidates:
         candidate_block = "\n\n".join(
@@ -99,18 +131,27 @@ this drawing type to specify that have no corresponding entry at all.
 
 DRAWING TYPE: {page_class} / {subtype}
 
-PARAMETERS ALREADY EXTRACTED FROM THIS DRAWING (already covered -- do NOT flag these as missing,
-even if the wording differs slightly from how a clause phrases it):
+PARAMETERS ALREADY EXTRACTED FROM THIS DRAWING (a curated list of facts that had a specific
+measurable value -- do NOT flag these as missing, even if the wording differs slightly from how
+a clause phrases it):
 {covered_block}
+
+ALL TEXT ACTUALLY WRITTEN ON THE DRAWING (every word on the sheet, including specification notes
+and general compliance statements that never became one of the parameters above because they
+don't have a single measurable value -- e.g. a note like "door furniture shall be distinguishable
+by visual contrast" satisfies that requirement even though no "contrast" parameter was extracted.
+Check this text, not just the parameter list above, before deciding something is absent):
+\"\"\"{raw_text_block}\"\"\"
 
 CANDIDATE REGULATION EXCERPTS for this drawing type (found by keyword search -- may or may not
 actually be relevant or applicable; do not assume they apply just because they were retrieved):
 {candidate_block}
 
 For each excerpt that states a specific, checkable requirement for THIS drawing type (not a
-generic administrative rule) and has no match among the already-extracted parameters, list it as
-a missing item. If an excerpt doesn't actually apply to this drawing type, or the knowledge base
-genuinely has nothing relevant to check this drawing type against, do not force a result --
+generic administrative rule) and is addressed NEITHER by the extracted parameters NOR by the raw
+drawing text above (even paraphrased, even as a general note rather than a specific value), list
+it as a missing item. If an excerpt doesn't actually apply to this drawing type, or the knowledge
+base genuinely has nothing relevant to check this drawing type against, do not force a result --
 return an empty list or mark confidence "not_applicable".
 
 Respond with ONLY a JSON array, no markdown fences, no commentary. Each element:
@@ -118,7 +159,7 @@ Respond with ONLY a JSON array, no markdown fences, no commentary. Each element:
   "requirement": "<short name of the missing requirement, e.g. 'fire door rating'>",
   "expected_parameter_hint": "<what a parameter_name would look like if it had been extracted, or null>",
   "confidence": "likely_missing" | "possibly_missing" | "not_applicable",
-  "reasoning": "<one or two sentences, citing the excerpt number in brackets if you used one>",
+  "reasoning": "<one or two sentences; say explicitly if you checked the raw drawing text and found nothing addressing this, citing the excerpt number in brackets if you used one>",
   "cited_excerpt_index": 0
 }}
 "cited_excerpt_index" should be null if no excerpt was actually used (e.g. confidence is
@@ -150,6 +191,7 @@ def detect_missing_items_for_group(
     page_numbers: list[int],
     chunks: list[RegulationChunk],
     client: OpenRouterClient,
+    raw_text: str = "",
     model: str = DEFAULT_MODEL,
     verbose: bool = False,
 ) -> list[MissingItem]:
@@ -158,7 +200,7 @@ def detect_missing_items_for_group(
     candidates = find_candidate_clauses_for_terms(terms, chunks, top_k=8)
     _vprint(verbose, f"  [Match] {page_class}/{subtype} -> {len(candidates)} candidate(s)")
 
-    prompt = _build_absence_prompt(page_class, subtype, covered_params, candidates)
+    prompt = _build_absence_prompt(page_class, subtype, covered_params, candidates, raw_text)
     raw_response = client.complete(model=model, prompt=prompt)
     _vprint(verbose, f"  [Absence] {page_class}/{subtype} -> " + raw_response.replace("\n", " "))
 
@@ -244,14 +286,17 @@ def detect_missing_items_for_pdf(
 
     results: list[MissingItem] = []
     for (page_class, subtype), group in groups.items():
+        page_numbers = sorted(p for p in group["page_numbers"] if p is not None)
+        raw_text = _load_raw_page_text(pdf_out_dir, page_numbers)
         results.extend(
             detect_missing_items_for_group(
                 page_class=page_class,
                 subtype=subtype,
                 covered_params=sorted(group["covered_params"]),
-                page_numbers=sorted(p for p in group["page_numbers"] if p is not None),
+                page_numbers=page_numbers,
                 chunks=chunks,
                 client=client,
+                raw_text=raw_text,
                 model=model,
                 verbose=verbose,
             )
