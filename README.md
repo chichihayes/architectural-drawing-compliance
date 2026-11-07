@@ -1,8 +1,9 @@
 # Architectural Drawing Compliance Pipeline
 
 An AI pipeline that reads CAD-exported architectural drawing PDFs and checks them against
-UK (Northern Ireland) building regulations — producing **pass / fail / flag verdicts with the
-exact regulation clause cited as evidence** for every finding.
+UK (Northern Ireland) building regulations — producing **pass / fail / flag verdicts, plus
+requirements the drawing doesn't show at all, with the exact regulation clause cited as evidence**
+for every finding.
 
 A personal R&D project. Prototype status: working end-to-end on real drawing sets.
 
@@ -18,8 +19,13 @@ Give it a drawing PDF (floor plan, electrical plan, elevation, …) and it will:
 3. **Match** each fact against a knowledge base of building-regulation clauses and **judge** it:
    `pass`, `fail`, `flag` (needs human review), or `no_matching_clause` — never forcing a verdict
    onto an irrelevant clause.
+4. **Check for absence** — not just whether present values are correct, but whether something the
+   regulations expect for this drawing type was never shown at all. This is the harder, more common
+   real-world case: most actual Building Control rejections are "please provide X," not "X is wrong."
 
-Every verdict traces back to a verbatim quote on the drawing (with page coordinates) and a verbatim
+The app presents this as two pages: **Analysis** (classification + extracted facts, Stages A+B) and
+**Report** (one written document combining Stage C's checks and Stage D's missing-items findings,
+downloadable as a PDF). Every finding traces back to a verbatim quote on the drawing and a verbatim
 excerpt from the regulation document, so a human reviewer can verify any finding in seconds.
 
 ### Example of a real catch
@@ -30,6 +36,25 @@ On a real electrical plan, the pipeline flagged:
 > *"Paragraph 5.41 of Technical Booklet R: 2012 specifies that socket outlets should be located
 > not more than 1000 mm above floor level, whereas the drawing specifies 1100 mm."*
 > — with the full clause text from `TechnicalBookletR2012.pdf` attached as evidence.
+
+### Example of a real absence catch
+
+Tested against a real approved floor plan from a live NI Building Control case (`25-110`), Stage D
+correctly flagged a genuine gap and — after a fix described below — correctly *stopped* flagging
+four things that were actually already on the drawing:
+
+> **Likely missing — stair/ramp soffit protection**
+> *"Any area below the soffit of a stair or a ramp... that is less than 2100 mm above a circulation
+> route, should be protected by a distinguishable barrier rail..." (Technical Booklet R: 2012, 4.9)*
+> — the drawing shows a stair with no such note anywhere on the sheet.
+
+The first version of Stage D also flagged "door opening furniture visual contrast" as missing on
+this same drawing — wrongly, since the drawing's own general notes quote that exact regulation
+wording verbatim. The bug: Stage B only extracts facts with a specific measurable value, so a
+"shall be distinguishable by visual contrast" note (no number, no named standard) never became a
+*fact* for Stage D to see. The fix: Stage D now also reads the drawing's raw extracted text
+(free — already saved by Stage A) before concluding anything is absent, not just the curated
+parameter list.
 
 ---
 
@@ -57,8 +82,13 @@ flowchart LR
         JUDGE["judge.py<br/>pass / fail / flag /<br/>no_matching_clause"]
     end
 
+    subgraph D["Stage D &mdash; Absence detection"]
+        ABSENCE["absence_agent.py<br/>what's required for this<br/>drawing type but not shown"]
+    end
+
     KB[("knowledge_base/<br/>regulation texts")]
     OUT[/"verdicts.json +<br/>verdicts_summary.json"/]
+    OUTD[/"missing_items.json"/]
 
     PDF --> VR & IR
     VR --> CLS
@@ -68,6 +98,11 @@ flowchart LR
     KB --> MATCH
     MATCH --> JUDGE
     JUDGE --> OUT
+    CLS --> ABSENCE
+    FEAT --> ABSENCE
+    VR -. "raw page text, for checking a note<br/>that satisfies a requirement but has<br/>no extractable value" .-> ABSENCE
+    KB --> ABSENCE
+    ABSENCE --> OUTD
 ```
 
 Each stage writes its results to disk and the next stage reads them back — so re-running Stage C
@@ -104,6 +139,26 @@ flowchart TD
     P & FAIL & FLAG --> E["Verdict + reasoning +<br/>verbatim cited clause text"]
 ```
 
+### How an absence finding is decided
+
+One retrieval + one LLM call per unique drawing type on the sheet (not per fact, not per
+regulation chunk — stays roughly as cheap as a single Stage C judgement):
+
+```mermaid
+flowchart TD
+    G["Drawing type (e.g. Architectural / Floor Plan)"] --> R2["Retrieve top-k candidate clauses<br/>for this drawing type"]
+    R2 --> Q2{"Is this requirement already<br/>satisfied by an extracted fact<br/>OR by the drawing's raw text?"}
+    Q2 -- "Yes" --> SKIP["not listed &mdash; already addressed"]
+    Q2 -- "No, and it applies here" --> MISS["likely_missing / possibly_missing"]
+    Q2 -- "Doesn't apply to this drawing" --> NA["not_applicable &mdash; no finding,<br/>not a fabricated citation"]
+```
+
+The "raw text" check matters: a drawing can satisfy a requirement with a general note (e.g.
+quoting the regulation's own wording) without that note ever becoming a Stage B *fact* — facts
+need a specific measurable value, a "shall be distinguishable by visual contrast" statement has
+none. Without checking the drawing's actual text, this stage would wrongly flag anything not on
+the curated parameter list as absent, even when it's right there on the sheet.
+
 ---
 
 ## Design principles
@@ -135,13 +190,15 @@ src/
   agents/
     classifier_agent.py      # Stage A — page classification
     feature_agent.py         # Stage B — fact extraction (two-pass: whole page + per note block)
-    matcher.py               # Stage C part 1 — clause retrieval (keyword, no AI)
+    matcher.py               # Stage C part 1 — clause retrieval (keyword, no AI); shared by Stage D
     judge.py                 # Stage C part 2 — compliance judgement
+    absence_agent.py         # Stage D — absence detection (reads Stage A's raw page text too)
     vision_transcriber.py    # supplementary tiled-vision audit tool (expensive, optional)
   openrouter_client.py       # OpenRouter (OpenAI-compatible) API wrapper
+  report.py                  # writes Stage C+D up as one document, shared by the report page and its PDF
   pipeline.py                # orchestrator (stub — stages currently run separately)
-app.py                       # Flask demo web UI
-templates/, static/          # demo UI assets
+app.py                       # Flask web UI — Analysis page (A+B) and Report page (C+D)
+templates/, static/          # UI assets (report.html, _drawing_header.html, _eyes.html, run.js, style.css)
 outputs/                     # per-PDF results, one folder per PDF (gitignored)
 tests/
 ```
@@ -187,13 +244,15 @@ every entry point takes a `model` argument).
 python app.py
 ```
 
-Open **http://127.0.0.1:5000/**, upload a PDF (or pick one already in `data/`), then run
-Stage A → B → C from the dashboard. Verdicts display as a filterable table — click the
-pass / fail / flag / no-match badges to filter.
+Open **http://127.0.0.1:5000/**, upload a PDF (or pick one already in `data/`). Two pages per
+drawing: **Analysis** (runs Stage A then B — classification and extracted facts) and **Report**
+(runs Stage C then D — one written document covering what fails a clause, what's missing, and
+what needs a person to confirm, with a "Download PDF" of the same content).
 
 ### Option 2 — CLI, stage by stage
 
-Run in order; each stage requires the previous stage's output for that PDF.
+Run in order; each stage requires the previous stage's output for that PDF. Stage D only needs
+A + B (not C).
 
 ```bash
 # Stage A — classify every page (~1 API call per page)
@@ -205,6 +264,9 @@ python -m src.agents.feature_agent "data/your-drawing.pdf"
 # Stage C — match against regulations and judge
 # (optional trailing number = judge only the first N facts, for a cheap test run)
 python -m src.agents.judge "data/your-drawing.pdf" 5
+
+# Stage D — check for requirements this drawing type expects but doesn't show
+python -m src.agents.absence_agent "data/your-drawing.pdf"
 ```
 
 ### Outputs
@@ -219,6 +281,7 @@ All results land in `outputs/<pdf-name>/`:
 | `features.json` | B | every extracted fact with source quote + coordinates |
 | `verdicts.json` | C | one verdict per fact with reasoning + cited clause |
 | `verdicts_summary.json` | C | counts, plus failures and flags pulled out |
+| `missing_items.json` | D | requirements with no corresponding fact or drawing note, with cited clause |
 
 ### Supplementary tools
 
@@ -238,9 +301,9 @@ python -m src.agents.matcher
 | Area | Today | Planned |
 |---|---|---|
 | Clause retrieval | Keyword overlap over raw text chunks | Structured clause records (`clause_schema.json`) and/or embedding search — target: cut the `no_matching_clause` rate |
-| Orchestration | Three separate stage commands | `pipeline.py` one-command run |
-| Evaluation | Anecdotal (real catches on test drawings) | Systematic scoring against ground-truth building-control rejection/approval letters |
-| Coverage | 3 NI Technical Booklets | Full Technical Booklet set; extendable to England/Wales Approved Documents |
+| Orchestration | Four separate stage commands | `pipeline.py` one-command run |
+| Evaluation | Started — checked against real NI Building Control rejection letters (5 real cases on file); caught and fixed a real false-positive class in Stage D this way | Score every stage systematically against the full set, not spot-check one drawing at a time |
+| Coverage | 3 of ~15 NI Technical Booklets (E, R, F1) | Full Technical Booklet set — the real rejection letters on file cite several (D, H, N, V) that aren't covered yet, so Stage D can't be grounded for those areas until sourced |
 | Tests | None yet | Unit tests for parsing, note-block detection, retrieval |
 
 ---
